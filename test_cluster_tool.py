@@ -487,9 +487,16 @@ class TestTransactionalBoot(unittest.TestCase):
         self.mock_env = MockStateEnv()
         self.mock_env.setup(self._INITIAL_STATE)
         self.calls = []
+        self._ps_file = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        json.dump({"auths": {"quay.io": {"auth": "dGVzdA=="}}}, self._ps_file)
+        self._ps_file.close()
 
-    def _boot_args(self, no_rollback=False, pull_secret=None):
-        return argparse.Namespace(name="aabbccdd", flavor="default", no_rollback=no_rollback, pull_secret=pull_secret)
+    def tearDown(self):
+        os.unlink(self._ps_file.name)
+
+    def _boot_args(self, no_rollback=False):
+        return argparse.Namespace(name="aabbccdd", flavor="default", no_rollback=no_rollback,
+                                  pull_secret=self._ps_file.name)
 
     def _make_ssh_mock(self, fail_on):
         destroyed = set()
@@ -1247,6 +1254,11 @@ class TestSnapshot(unittest.TestCase):
                 r.stdout = "quay.io/test/etcd:latest"
             elif "cluster-tool.key.pub" in cmd and "cat" in cmd:
                 r.stdout = "ssh-ed25519 AAAA_fake_pub_key test@host"
+            elif "nodeip-configuration.service" in cmd:
+                r.stdout = "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:" + "0" * 64
+            elif "podman image exists" in cmd:
+                r.returncode = 1
+                r.stdout = ""
             else:
                 r.stdout = ""
             return r
@@ -1420,6 +1432,66 @@ class TestSnapshot(unittest.TestCase):
         self.assertIn("xargs -r sudo crictl rm", cmd)
         self.assertIn("crictl --timeout 120s rmi --prune", cmd)
         self.assertIn("podman image prune -a -f", cmd)
+        self.assertIn("podman rm cache-recert", cmd)
+
+    @patch("time.sleep")
+    def test_snapshot_caches_recert_before_prune(self, _):
+        ssh = self._make_ssh_mock()
+        wrapped = self.mock_env.wrap_run_positional(ssh)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args())
+
+        pull_cmds = [c for c in self.calls if "podman pull" in c and ct.RECERT_IMAGE in c]
+        self.assertEqual(len(pull_cmds), 1, "must pull recert image")
+        anchor_cmds = [c for c in self.calls if "podman create --replace --name cache-recert" in c]
+        self.assertEqual(len(anchor_cmds), 1, "must create anchor container")
+
+        pull_idx = next(i for i, c in enumerate(self.calls) if "podman pull" in c and ct.RECERT_IMAGE in c)
+        anchor_idx = next(i for i, c in enumerate(self.calls) if "podman create --replace --name cache-recert" in c)
+        prune_idx = next(i for i, c in enumerate(self.calls) if "podman image prune" in c)
+        self.assertLess(pull_idx, anchor_idx, "pull must happen before anchor creation")
+        self.assertLess(anchor_idx, prune_idx, "anchor must exist before prune runs")
+
+    @patch("time.sleep")
+    def test_snapshot_skips_pull_when_image_already_cached(self, _):
+        base_ssh = self._make_ssh_mock()
+        def ssh(*args, check=True, **kwargs):
+            cmd = args[-1]
+            if "podman image exists" in cmd:
+                self.calls.append(cmd)
+                r = MagicMock()
+                r.returncode = 0
+                r.stdout = ""
+                r.stderr = ""
+                return r
+            return base_ssh(*args, check=check, **kwargs)
+        wrapped = self.mock_env.wrap_run_positional(ssh)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args())
+
+        pull_cmds = [c for c in self.calls if "podman pull" in c]
+        self.assertEqual(pull_cmds, [], "must not pull an image already present locally")
+        anchor_cmds = [c for c in self.calls if "podman create --replace --name cache-recert" in c
+                       or "podman create --replace --name cache-nodeip" in c]
+        self.assertEqual(len(anchor_cmds), 2, "must still anchor both already-cached images")
+
+    @patch("time.sleep")
+    def test_snapshot_anchor_creation_survives_leftover_container(self, _):
+        ssh = self._make_ssh_mock()
+        wrapped = self.mock_env.wrap_run_positional(ssh)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args())
+
+        create_cmds = [c for c in self.calls if "podman create" in c and "cache-" in c]
+        self.assertTrue(create_cmds, "must create anchor containers")
+        self.assertTrue(all("--replace" in c for c in create_cmds),
+            "anchor creation must use --replace so a leftover container from a prior failed run doesn't collide")
 
     @patch("time.sleep")
     def test_snapshot_prune_before_shutdown(self, _):
@@ -2462,8 +2534,18 @@ class TestPullSecretInjection(unittest.TestCase):
         self.mock_env = MockStateEnv()
         self.mock_env.setup(self._INITIAL_STATE)
         self.calls = []
+        self._ps_file = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        json.dump({"auths": {"quay.io": {"auth": "dGVzdA=="}}}, self._ps_file)
+        self._ps_file.close()
 
-    def _boot_args(self, pull_secret=None):
+    def tearDown(self):
+        os.unlink(self._ps_file.name)
+
+    _SENTINEL = object()
+
+    def _boot_args(self, pull_secret=_SENTINEL):
+        if pull_secret is TestPullSecretInjection._SENTINEL:
+            pull_secret = self._ps_file.name
         return argparse.Namespace(name="aabbccdd", flavor="default", no_rollback=False, pull_secret=pull_secret)
 
     def _make_all_succeed_ssh(self):
@@ -2557,17 +2639,12 @@ class TestPullSecretInjection(unittest.TestCase):
     @patch.object(ct, "remove_dns_entry")
     @patch.object(ct, "remove_haproxy_clone")
     @patch.object(ct, "add_dns_entry")
-    def test_boot_without_pull_secret_no_injection(self, *_):
+    def test_boot_without_pull_secret_fails(self, *_):
         ssh = self.mock_env.wrap_run_positional(self._make_all_succeed_ssh())
         with patch.object(ct.env, "run", side_effect=ssh), \
              patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
-            ct.cmd_boot(self._boot_args(pull_secret=None))
-
-        cmds = [cmd for cmd, _ in self.calls]
-        self.assertFalse(any("pull-secret.json" in c for c in cmds),
-            "no pull secret injection should happen when --pull-secret is not provided")
-        self.assertFalse(any("set data secret/pull-secret" in c for c in cmds))
-        ct.KUBECONFIG_DIR.joinpath("aabbccdd.kubeconfig").unlink(missing_ok=True)
+            with self.assertRaises((SystemExit, TypeError)):
+                ct.cmd_boot(self._boot_args(pull_secret=None))
 
     @patch("time.sleep")
     @patch.object(ct, "remove_dns_entry")
